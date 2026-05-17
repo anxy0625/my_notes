@@ -1,0 +1,400 @@
+# MCP 协议深度解析：从底层原理到 Java 实践
+
+> 本文由一场关于 Anthropic MCP（Model Context Protocol）协议的技术问答整理而成，旨在帮助开发者系统性地理解 MCP 的设计思想、核心组件、通信机制、安全模型，以及如何使用 Java 构建一个功能完备的 MCP Server。
+
+---
+
+## 1. 什么是 MCP？为什么需要它？
+
+MCP（Model Context Protocol）是由 Anthropic 提出的一种开放协议，旨在为 AI 模型（如 Claude）与外部工具、数据源之间建立**标准化的连接接口**。它被比喻为 AI 世界的“USB-C 接口”：只要遵循协议，任何工具或数据都可以被 AI 应用以统一的方式发现和调用，而无需为每个工具编写定制适配器。
+
+传统上，集成外部 API 意味着模型需要理解每个 API 的具体格式、鉴权方式和功能描述，这带来极大的耦合和维护成本。MCP 通过定义一套**客户端-服务器架构**和**标准通信语言**，使得工具提供者只需实现一个 MCP Server，所有遵循协议的 AI 应用即可直接调用。
+
+---
+
+## 2. 核心架构：三大角色
+
+MCP 定义了三个关键角色：
+
+- **MCP 主机（Host）**：运行 AI 模型的应用本身，如 Claude Desktop、IDE 插件等。它负责管理多个 MCP 客户端连接，并协调模型的调用。
+- **MCP 客户端（Client）**：由主机创建，与一个 MCP Server 建立**1:1 的专用连接**，负责协议通信。客户端发送请求、接收响应，并将结果反馈给模型。
+- **MCP 服务器（Server）**：轻量级程序，通过标准化协议暴露特定功能（工具、资源、提示等）。它不接触用户的 API 密钥，所有资源访问的控制权在服务端，安全性更高。
+
+这三个角色各司其职，协同工作，实现了 AI 应用与外部工具的**松耦合集成**。
+
+---
+
+## 3. 通信机制：JSON-RPC 2.0 与传输层
+
+MCP 的全部通信都建立在 **JSON-RPC 2.0** 协议之上。这是一种轻量级的远程调用规范，定义了三种消息类型：
+
+- **请求（Request）**：必须包含唯一的 `id`，期待响应。
+- **响应（Response）**：包含与请求相同的 `id`，表示成功或失败。
+- **通知（Notification）**：单向消息，不包含 `id`，不期待响应。
+
+### 3.1 传输层
+
+MCP 的传输层负责实际的数据承载，支持两种方式：
+
+- **Stdio 传输**：通过标准输入/输出流通信，常用于本地进程间交互（如命令行工具与 IDE 的集成）。
+- **HTTP + SSE 传输**：客户端通过 HTTP POST 发送请求，服务器通过 Server-Sent Events 推送数据。适合远程服务调用和云端 API。
+
+开发者可以根据部署场景灵活选择传输方式。
+
+### 3.2 协议层与消息全集
+
+在传输层之上，协议层负责消息的封装、路由和生命周期管理。MCP 定义了一套**标准的消息方法**，不能由用户随意扩展。所有消息可归纳为以下类别：
+
+#### 客户端 → 服务端（请求）
+
+| 方法                            | 用途与场景                                                                 |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `initialize`                    | 建立连接与能力协商，客户端告知自身支持的功能                                 |
+| `ping`                          | 心跳检测，确认连接存活                                                      |
+| `tools/list`                    | 发现可用工具                                                                |
+| `tools/call`                    | 执行一个工具，携带参数                                                      |
+| `resources/list`                | 发现可用资源（只读数据）                                                    |
+| `resources/read`                | 读取指定 URI 的资源内容                                                     |
+| `resources/subscribe`           | 订阅资源更新通知                                                            |
+| `resources/unsubscribe`         | 取消订阅                                                                    |
+| `resources/templates/list`      | 列出参数化的资源 URI 模板                                                   |
+| `prompts/list`                  | 发现可用的提示模板                                                           |
+| `prompts/get`                   | 获取特定提示模板的内容                                                       |
+| `logging/setLevel`              | 设置服务端日志发送级别                                                       |
+| `roots/list`                    | 客户端告知服务端可访问的文件系统根目录                                        |
+
+#### 服务端 → 客户端（请求）
+
+| 方法                        | 用途与场景                                                                 |
+| --------------------------- | -------------------------------------------------------------------------- |
+| `ping`                      | 服务端心跳检测                                                              |
+| `sampling/createMessage`    | 服务端请求客户端使用其 LLM 生成文本                                         |
+| `elicitation/create`        | 服务端请求客户端向用户弹窗索要额外信息（引导）                                |
+| `completion/complete`       | 服务端请求客户端提供自动补全建议（如资源 URI、提示参数）                     |
+
+#### 通知（双向）
+
+| 方法                          | 方向             | 用途与场景                                                                |
+| ----------------------------- | ---------------- | ------------------------------------------------------------------------- |
+| `initialized`                 | 客户端 → 服务端   | 确认初始化完成，会话准备就绪                                              |
+| `cancelled`                   | 双向             | 取消一个进行中的请求                                                      |
+| `progress`                    | 双向             | 报告长时间任务的进度                                                      |
+| `resources/updated`           | 服务端 → 客户端   | 已订阅资源的特定内容已更新                                                |
+| `resources/list_changed`      | 服务端 → 客户端   | 资源列表发生变化，客户端应重新获取                                        |
+| `prompts/list_changed`        | 服务端 → 客户端   | 提示列表发生变化                                                          |
+| `tools/list_changed`          | 服务端 → 客户端   | 工具列表发生变化                                                          |
+| `logging/message`             | 服务端 → 客户端   | 服务端发送日志消息给客户端                                                |
+| `roots/list_changed`          | 客户端 → 服务端   | 客户端可访问的根目录列表发生变化                                           |
+
+这些方法构成了 MCP 完整的工作语言。开发 MCP Server 时，我们需要根据业务需求实现对应的消息处理逻辑。
+
+---
+
+## 4. 三大核心原语：工具、资源与提示
+
+MCP 将服务器对外暴露的能力抽象为三种“原语”（Primitives）。它们在实现层面看似相似——都是由服务端定义、客户端请求并返回结果，但设计哲学和职责截然不同。
+
+### 4.1 工具（Tools）
+
+工具代表**模型可调用的函数**，会带来**副作用**（如修改数据库、发送邮件、创建文件）。工具的执行需要明确的授权和调用逻辑，其返回结果也会反馈给模型。
+
+**示例**：定义一个获取天气的工具。
+
+```java
+@Service
+public class WeatherService {
+    @Tool(description = "获取指定城市的天气信息")
+    public String getWeather(String city) {
+        return city + " 的天气是晴天，温度22℃。";
+    }
+}
+```
+
+### 4.2 资源（Resources）
+
+资源是**只读的、模型可访问的数据接口**，通过唯一 URI 标识。它不产生副作用，可为模型提供文件内容、数据库记录等上下文，支持静态 URI 和参数化模板（如 `db://users/{userId}/profile`）。
+
+**示例**：暴露一个文件资源和数据库查询。
+
+```java
+@Service
+public class ResourceService {
+    @Tool(description = "获取系统操作手册")
+    public String getSystemManual() {
+        return "这是一个详细的系统操作手册......";
+    }
+
+    @Tool(description = "根据用户ID获取其详细资料")
+    public String getUserProfile(String userId) {
+        // 实际查询数据库
+        return "用户ID " + userId + " 的详细资料......";
+    }
+}
+```
+
+### 4.3 提示（Prompts）
+
+提示是**可复用的结构化消息模板**，旨在引导模型以特定方式执行任务，而非直接提供数据或执行动作。它可接受动态参数，确保交互格式一致性，防止用户或模型自由发挥导致的不稳定。
+
+**示例**：创建一个代码审查提示模板。
+
+```java
+@Service
+public class PromptService {
+    @Tool(description = "获取代码审查的提示模板")
+    public List<Map<String, String>> getCodeReviewPrompt(String language, String codeContent) {
+        String systemPrompt = String.format("你是一个资深的%s代码审查专家。请严格遵循代码规范，对以下代码进行审查：", language);
+        return List.of(
+            Map.of("role", "system", "content", systemPrompt),
+            Map.of("role", "user", "content", codeContent)
+        );
+    }
+}
+```
+
+### 4.4 为何要区分三者？
+
+尽管在实现上都是“定义-请求-响应”模式，但区分它们能带来以下好处：
+
+- **语义清晰**：模型能根据意图选择正确的调用路径——需要执行操作选工具，需要上下文数据选资源，需要规范应答选提示。
+- **安全管控**：工具可能涉及写操作，必须经过授权；资源和提示通常是安全的只读访问，可放宽限制。
+- **优化空间**：资源可被缓存、订阅更新；提示可被复用和组合，提升效率。
+
+直观理解：**工具 = 行动，资源 = 数据，提示 = 知识**。
+
+---
+
+## 5. 核心工作流程
+
+一次典型的 MCP 交互可概括为以下步骤：
+
+1. **能力发现**：客户端连接后，调用 `tools/list`、`resources/list` 等查询服务器提供的能力。
+2. **意图解析**：AI 模型分析用户自然语言输入，匹配合适的工具或资源。
+3. **权限验证**：对敏感操作，Host 应用会要求用户显式授权。
+4. **指令执行**：客户端通过 `tools/call` 等请求调用目标能力。
+5. **结果反馈**：服务端返回结构化数据，模型将其转换为自然语言回复。
+
+这个流程像极了“看菜单 → 点菜 → 确认 → 烹饪 → 上菜”，简洁而高效。
+
+---
+
+## 6. 安全机制与 OAuth 2.1 授权
+
+MCP 内置了多层安全机制，确保 AI 操作在可控范围内。
+
+### 6.1 多层安全体系
+
+- **传输安全**：TLS 加密 + Token 认证（如 Bearer Token）。
+- **权限控制**：基于 OAuth 2.1 的细粒度授权，结合 RBAC（基于角色的访问控制）和 ACL（访问控制列表），限制不同角色可调用的工具。
+- **运行时防护**：速率限制、IP 白名单、请求参数审计，以及可选的“工具防火墙”在请求到达核心服务前进行拦截。
+- **沙箱隔离**：限制 MCP Server 进程的文件系统访问和网络权限。
+- **用户批准**：敏感操作需要用户在弹出的对话框中点击“允许”才能执行。
+
+### 6.2 OAuth 2.1 授权流程详解
+
+当 MCP 服务器需要访问用户的受保护资源时（如用户的邮箱、网盘），就会启用 OAuth 2.1 授权。关键问题是：**客户端何时知道该发起授权？**
+
+答案：当客户端尝试访问 MCP 服务器时，若请求的资源需要授权，服务器会返回 `HTTP 401 Unauthorized`，并在响应头 `WWW-Authenticate` 中携带 **受保护资源元数据（PRM）** 的 URL。客户端解析该元数据后，自动启动授权流程。
+
+完整流程如下：
+
+1. **初始请求被拒**：客户端 → MCP Server，返回 `401` + PRM 信息。
+2. **获取 PRM**：客户端访问 PRM URL，得到授权服务器地址。
+3. **获取授权服务器元数据**：客户端访问 `/.well-known/oauth-authorization-server`，获取授权端点、令牌端点等。
+4. **动态客户端注册（可选）**：客户端向授权服务器注册自身，获得 `client_id`。
+5. **发起授权请求**：客户端生成 PKCE 的 `code_verifier` 和 `code_challenge`，引导用户浏览器跳转至授权端点。
+6. **用户授权**：用户在授权页登录并批准权限。
+7. **获取授权码**：授权服务器重定向回客户端，附带 `authorization_code`。
+8. **交换令牌**：客户端将 `authorization_code` 和 `code_verifier` 发送到令牌端点，换取 `access_token`（和可选的 `refresh_token`）。
+9. **重试原始请求**：客户端用 `access_token` 再次请求 MCP Server，通过验证后成功访问资源。
+
+整个过程对用户透明，只需在浏览器中点击“允许”即可。MCP Server 只需验证令牌的签名和权限范围，无需管理用户凭据。
+
+---
+
+## 7. 关键特性：进度通知、请求引导与能力协商
+
+这三个特性是 MCP 实现“智能交互”的基石，下面通过具体场景和 Java 代码详细说明。
+
+### 7.1 进度通知（Progress Notification）
+
+**场景**：执行一个生成 100 个城市天气报表的长时间任务，需要让用户看到进度。
+
+**原理**：客户端在调用工具时，可在请求的 `_meta` 中提供 `progressToken`。服务端处理过程中，通过 `notifications/progress` 通知周期性地向客户端发送当前进度和总数。
+
+**Java 实现（Spring AI）**：
+
+```java
+@Service
+public class WeatherReportService {
+
+    private final McpSyncServer mcpServer;
+
+    public WeatherReportService(McpSyncServer mcpServer) {
+        this.mcpServer = mcpServer;
+    }
+
+    @Tool(description = "生成指定城市数量的天气报表，会报告进度")
+    public String generateWeatherReport(@ToolParam(description = "城市数量") int cityCount,
+                                        ToolContext toolContext) {
+        String progressToken = toolContext.getContext().get("progressToken");
+        if (progressToken == null) {
+            progressToken = UUID.randomUUID().toString();
+        }
+
+        for (int i = 0; i < cityCount; i++) {
+            // 模拟处理时间
+            Thread.sleep(50);
+
+            // 发送进度通知
+            mcpServer.sendNotification(
+                "notifications/progress",
+                Map.of(
+                    "progressToken", progressToken,
+                    "progress", i + 1,
+                    "total", cityCount,
+                    "message", "正在处理第 " + (i+1) + "/" + cityCount + " 个城市..."
+                )
+            );
+        }
+        return "报表生成完成，共处理 " + cityCount + " 个城市。";
+    }
+}
+```
+
+客户端（如 Claude Desktop）收到这些通知后，会在界面上实时显示进度条。
+
+### 7.2 请求引导（Elicitation）
+
+**场景**：工具 `sendEmail` 需要用户的真实邮箱地址，但模型未提供。我们希望弹出一个对话框让用户输入。
+
+**原理**：服务端可主动向客户端发送 `elicitation/create` 请求，要求其向用户索取必要信息。Spring AI 将其封装为 `ElicitationRequiredException`。
+
+**Java 实现**：
+
+```java
+@Service
+public class EmailService {
+
+    @Tool(description = "发送邮件，若缺少收件人地址会引导用户输入")
+    public String sendEmail(@ToolParam(description = "邮件内容") String content,
+                            @ToolParam(description = "收件人邮箱（可选）") String recipient) {
+        if (recipient == null || recipient.isBlank()) {
+            throw new ElicitationRequiredException(
+                new ElicitationRequest.Builder()
+                    .message("请提供您的邮箱地址，以便发送邮件")
+                    .required(true)
+                    .schema("{\"type\":\"string\",\"format\":\"email\"}")
+                    .build()
+            );
+        }
+        return "邮件已发送至 " + recipient + "，内容：" + content;
+    }
+}
+```
+
+客户端收到引导请求后，会暂停当前对话并弹出模态框。用户输入后，框架会用输入值**重新调用该工具方法**，整个过程对开发者完全透明。
+
+### 7.3 能力协商（Capability Negotiation）
+
+**场景**：我们的 MCP Server 同时支持工具、资源和采样功能，需要根据客户端的能力进行适配。
+
+**原理**：在 `initialize` 阶段，客户端和服务器互相声明自己的能力，最终以**交集**为准。若客户端不支持采样，即使服务器声明了该能力，也不能向客户端发送 `sampling/createMessage` 请求。
+
+**Java 实现**：
+
+- **服务端配置能力**（`application.properties`）：
+  ```properties
+  spring.ai.mcp.server.capabilities.tools=true
+  spring.ai.mcp.server.capabilities.resources=true
+  spring.ai.mcp.server.capabilities.prompts=true
+  spring.ai.mcp.server.capabilities.sampling=true
+  ```
+
+- **客户端声明能力**（代码示例）：
+  ```java
+  var client = McpClient.sync(transport)
+      .clientCapabilities(ClientCapabilities.builder()
+              .sampling(true)   // 支持采样
+              .roots(false)     // 不支持根目录管理
+              .build())
+      .build();
+  client.initialize(); // 此方法内完成协商
+  ```
+
+服务端在后续处理中，可通过 `clientCapabilities.isSamplingEnabled()` 等检查协商结果，确保只发送双方都支持的消息。
+
+---
+
+## 8. MCP 与传统 API 的对比
+
+| 特性         | 传统 API                           | MCP 协议                                      |
+| ------------ | ---------------------------------- | --------------------------------------------- |
+| **集成方式** | 每个工具需开发独立适配器           | 统一标准，一次开发，多端通用                    |
+| **服务发现** | 通常依赖硬编码或外部文档           | 动态发现，客户端自动获取可用工具/资源/提示列表  |
+| **交互模式** | 请求-响应                          | 双向流式通信，支持服务端推送（进度、日志等）    |
+| **核心抽象** | 特定的接口和端点                   | 工具、资源、提示三大原语                        |
+| **安全模型** | 各异，通常需要 API Key             | 内置 OAuth 2.1 授权，用户批准，沙箱隔离         |
+
+---
+
+## 9. 使用 Java 构建 MCP Server 的两种方式
+
+### 9.1 基于 Spring AI（推荐）
+
+Spring AI 提供了 Boot Starter 和注解，极大简化开发。
+
+**依赖**：
+```xml
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+**开发**：使用 `@Tool` 注解将任意方法暴露为 MCP 工具，如上面的所有示例。还支持 `@McpResource`、`@McpPrompt` 等注解来定义资源和提示。
+
+### 9.2 使用官方 MCP Java SDK
+
+适合需要更底层控制或非 Spring 项目。
+
+**依赖**：
+```xml
+<dependency>
+    <groupId>io.modelcontextprotocol.sdk</groupId>
+    <artifactId>mcp</artifactId>
+    <version>0.15.0</version>
+</dependency>
+```
+
+**构建 Server**：
+```java
+HttpServletSseServerTransportProvider transportProvider =
+    new HttpServletSseServerTransportProvider(new ObjectMapper(), "/mcp", "/sse");
+
+ToolSpecification toolSpec = ToolSpecification.builder()
+    .name("echo")
+    .description("Echoes back the input message")
+    .inputSchema(Schema.schema()
+        .addProperty("message", Schema.schema(SchemaType.STRING).description("要回显的消息"))
+        .build())
+    .build();
+
+McpServer server = McpServer.sync(transportProvider)
+    .serverInfo("my-server", "1.0.0")
+    .addTool(toolSpec, (context, request) -> {
+        String msg = request.getArguments().get("message").asText();
+        return new ToolCallResult("Echo: " + msg);
+    })
+    .build();
+server.start();
+```
+
+---
+
+## 10. 总结
+
+MCP 协议为 AI 与外部世界的连接提供了标准化、安全的解决方案。通过深入理解其架构、消息体系、三大原语和安全机制，我们可以构建出强大且易于集成的工具服务器。无论是使用 Spring AI 快速开发，还是基于官方 SDK 进行深度定制，Java 开发者都能高效地将业务能力开放给 AI 模型，开启智能应用的新可能。
+
+希望这篇文章能帮助你与你的同事全面掌握 MCP 的原理和实践。让我们一起迎接 AI 工具集成标准化的时代。
